@@ -127,6 +127,20 @@ Build a modern, cloud native, fully self contained JAR file:
 The JAR will be created in the `fineract-provider/build/libs` directory.
 If you intend to use MariaDB or MySQL (warning: [both are deprecated](https://cwiki.apache.org/confluence/display/FINERACT/FSIP-9%3A+Standardize+on+PostgreSQL)), you must download the appropriate JDBC driver yourself and override default database settings. When you start the JAR, specify the directory containing the JDBC driver.
 
+### Automated refactoring with OpenRewrite
+
+The OpenRewrite Gradle plugin is applied to the root project so it can parse all
+modules. No recipes are active by default.
+
+```bash
+./gradlew rewriteDiscover
+./gradlew rewriteDryRun -Drewrite.activeRecipe=<recipe-name>
+./gradlew rewriteRun -Drewrite.activeRecipe=<recipe-name>
+```
+
+Use `rewriteDryRun` to review the generated patch before applying a recipe with
+`rewriteRun`.
+
 MariaDB example:
 
 ```bash

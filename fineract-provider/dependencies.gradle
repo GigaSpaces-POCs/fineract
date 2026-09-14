@@ -77,6 +77,8 @@ dependencies {
             'io.micrometer:micrometer-registry-prometheus',
             'io.micrometer:micrometer-registry-otlp',
             'io.micrometer:micrometer-registry-cloudwatch2',
+            'io.micrometer:micrometer-tracing-bridge-otel',
+            'io.opentelemetry:opentelemetry-exporter-otlp',
 
             'io.awspring.cloud:spring-cloud-aws-starter',
 
