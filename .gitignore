@@ -35,3 +35,6 @@ gradleExp/
 .java-version
 
 .windsurf/
+
+# Local Compose interpolation values (e.g. FINERACT_USER/FINERACT_GROUP); host-specific
+.env

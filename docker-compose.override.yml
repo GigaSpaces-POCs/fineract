@@ -26,13 +26,28 @@
 # for their own container logs, which requires the grafana/loki-docker-driver
 # Docker plugin to be installed on the host. That's a log-shipping concern
 # unrelated to metrics/traces, so it's reset to the default driver here.
+#
+# Each stateful service gets a named volume. Without them the database, the
+# Prometheus TSDB and the Kafka log all live in the container writable layer and
+# are destroyed by `docker compose down` - which on a metrics-focused stack means
+# losing every sample collected so far. Use `docker compose down -v` when a clean
+# slate is actually wanted.
 services:
+  # Postgres 18 uses a versioned data directory (/var/lib/postgresql/18/docker),
+  # not the pre-18 /var/lib/postgresql/data, so the parent tree is mounted to stay
+  # correct across image upgrades.
+  db:
+    volumes:
+      - fineract-db-data:/var/lib/postgresql
+
   kafka:
     image: "apache/kafka:4.2.0-rc2"
     ports:
       - "9092:9092"
     env_file:
       - ./config/docker/env/kafka-server.env
+    volumes:
+      - fineract-kafka-data:/var/lib/kafka/data
 
   prometheus:
     extends:
@@ -40,6 +55,8 @@ services:
       service: prometheus
     logging:
       driver: json-file
+    volumes:
+      - fineract-prometheus-data:/prometheus
 
   grafana:
     extends:
@@ -47,6 +64,8 @@ services:
       service: grafana
     logging:
       driver: json-file
+    volumes:
+      - fineract-grafana-data:/var/lib/grafana
 
   tempo:
     extends:
@@ -68,6 +87,10 @@ services:
     # docker-compose-postgresql-kafka.yml) - turning it on for this single
     # all-in-one node would route scheduled-job messages through Kafka with no
     # worker consuming them, so jobs would silently stop running.
+    #
+    # Note that enabling the transport is not sufficient to see any traffic: every
+    # entry in m_external_event_configuration ships disabled, so no event type is
+    # produced until it is switched on via PUT /api/v1/externalevents/configuration.
     environment:
       FINERACT_EXTERNAL_EVENTS_ENABLED: "true"
       FINERACT_EXTERNAL_EVENTS_KAFKA_ENABLED: "true"
@@ -75,4 +98,13 @@ services:
     networks:
       default:
         aliases:
+          # config/docker/prometheus/etc/prometheus.yml scrapes the target
+          # "fineract-server:8443"; without this alias that name does not resolve
+          # and the scrape job silently fails.
           - fineract-server
+
+volumes:
+  fineract-db-data:
+  fineract-kafka-data:
+  fineract-prometheus-data:
+  fineract-grafana-data:
