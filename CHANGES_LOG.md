@@ -119,3 +119,64 @@ from Maven Central without repository credentials.
 - Covers all subprojects from the root plugin configuration.
 
 ---
+
+## Change #3: Normalize Request URIs for Traces as Well as Metrics
+
+**Date**: 2026-09-14
+**Files Modified**:
+- `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/FineractServerRequestObservationConvention.java`
+- `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/MetricsConfig.java`
+
+**Type**: Fix
+
+### Problem
+After Change #1, `http_server_requests` reported normalized URIs such as
+`/api/v1/users/{id}`, but the corresponding **spans did not**. A span for the same
+request carried `uri=/api/v1/users/1` - the raw id - and was named just `http get`,
+with no route at all.
+
+The cause is that the normalization lived in a `MeterFilter`. A `MeterFilter` is
+applied by the Micrometer **meter registry** and is never consulted when a span is
+recorded, so only metrics benefited. Three consequences:
+
+1. Span tag cardinality stayed unbounded in the tracing backend - the very problem
+   Change #1 set out to prevent, still present on the trace side.
+2. Metric-to-trace correlation by `uri` was impossible: the metric said
+   `/api/v1/users/{id}` while the span said `/api/v1/users/1`.
+3. Every Fineract span was named `http get` / `http post`, making the trace list
+   unreadable and `{span.uri=...}` TraceQL queries return nothing useful.
+
+### Solution
+Moved normalization into `FineractServerRequestObservationConvention`, which sits on
+the observation path shared by **both** metrics and traces:
+
+- `normalizeUri(String)` holds the single `/\d+(?=/|$)` -> `/{id}` implementation.
+- `uri(...)` applies it to the resolved path, so the low-cardinality tag is bounded
+  wherever it is consumed.
+- `getContextualName(...)` appends the normalized path when Spring resolved no
+  handler pattern, so spans are named `http get /api/v1/users/{id}`.
+
+`MetricsConfig` now delegates to that same method, keeping its `MeterFilter` purely
+as a backstop for meters recorded by other instrumentation, and retaining the
+cardinality limit (raised from 100 to 650 on 2026-09-15, above the ~470 declared routes). The raw path remains available on the span as
+`http.url` for debugging an individual request.
+
+### Verification
+```
+span name : http get /api/v1/users/{id}
+uri       : /api/v1/users/{id}
+http.url  : /fineract-provider/api/v1/users/1
+```
+`{span.uri="/api/v1/offices/{id}"}` in TraceQL returns the matching traces; the
+`http_server_requests` output is unchanged, still with zero `UNKNOWN`.
+
+### Note on the Change #1 root cause
+Change #1 attributes `uri="UNKNOWN"` to Micrometer masking high-cardinality values.
+That is not the mechanism. Fineract's API is served by **Jersey (JAX-RS)**, not Spring
+MVC, so `DefaultServerRequestObservationConvention` never finds a handler-mapping
+pattern and substitutes the literal string `UNKNOWN` regardless of cardinality. The
+fix shipped in Change #1 is correct - it is the explanation that misleads, and it
+matters because it points a reader at the cardinality limit rather than at the
+convention when tuning this area.
+
+---
