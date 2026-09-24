@@ -32,6 +32,12 @@
 # are destroyed by `docker compose down` - which on a metrics-focused stack means
 # losing every sample collected so far. Use `docker compose down -v` when a clean
 # slate is actually wanted.
+# Every service below pins an explicit json-file size cap. There is no
+# /etc/docker/daemon.json on the host, so the default driver keeps container
+# logs forever: a service that starts error-looping will fill the root
+# filesystem. Steady-state logging is negligible (~8 bytes per simulated API
+# action), so these caps exist purely to bound the failure case. Total ceiling
+# across the stack is ~430 MB.
 services:
   # Postgres 18 uses a versioned data directory (/var/lib/postgresql/18/docker),
   # not the pre-18 /var/lib/postgresql/data, so the parent tree is mounted to stay
@@ -39,6 +45,11 @@ services:
   db:
     volumes:
       - fineract-db-data:/var/lib/postgresql
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
 
   kafka:
     image: "apache/kafka:4.2.0-rc2"
@@ -48,6 +59,11 @@ services:
       - ./config/docker/env/kafka-server.env
     volumes:
       - fineract-kafka-data:/var/lib/kafka/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
 
   prometheus:
     extends:
@@ -55,8 +71,18 @@ services:
       service: prometheus
     logging:
       driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - fineract-prometheus-data:/prometheus
+    # Upstream passes only --config.file, which leaves Prometheus on its 15d
+    # default with no size ceiling. retention.size is the one that actually
+    # protects the disk, since retention.time scales with series count.
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=15d'
+      - '--storage.tsdb.retention.size=5GB'
 
   grafana:
     extends:
@@ -64,6 +90,9 @@ services:
       service: grafana
     logging:
       driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - fineract-grafana-data:/var/lib/grafana
 
@@ -73,6 +102,20 @@ services:
       service: tempo
     logging:
       driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+    # observability.yml bind-mounts the host's /tmp/tempo for trace storage, and
+    # this host ships the stock tmpfiles rule `q /tmp 1777 root root 10d` with
+    # systemd-tmpfiles-clean.timer active. That is survivable only while Tempo's
+    # block_retention is under 10 days; past that, systemd deletes blocks out
+    # from under a running Tempo. A named volume removes the dependency on /tmp
+    # entirely, which is what lets tempo.yml raise retention to 24h.
+    #
+    # The inherited /tmp/tempo bind mount cannot be removed through `extends`,
+    # so it stays mounted but unused once tempo.yml points at /var/tempo.
+    volumes:
+      - fineract-tempo-data:/var/tempo
 
   fineract:
     depends_on:
@@ -102,9 +145,15 @@ services:
           # "fineract-server:8443"; without this alias that name does not resolve
           # and the scrape job silently fails.
           - fineract-server
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
 
 volumes:
   fineract-db-data:
   fineract-kafka-data:
   fineract-prometheus-data:
   fineract-grafana-data:
+  fineract-tempo-data:
