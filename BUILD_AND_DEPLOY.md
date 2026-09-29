@@ -105,15 +105,60 @@ Expect entries such as `uri="/api/v1/offices/{id}"`, and no `uri="UNKNOWN"`.
 
 Endpoints:
 
-| Service    | URL                                            |
-| ---------- | ---------------------------------------------- |
+| Service    | Address                                         |
+| ---------- | ----------------------------------------------- |
 | Fineract   | https://localhost:8443/fineract-provider/api/v1 |
-| Grafana    | http://localhost:3000 (admin/admin)            |
-| Prometheus | http://localhost:9090                          |
-| Tempo      | http://localhost:3200                          |
+| Grafana    | http://localhost:3000 (admin/admin)             |
+| Prometheus | http://localhost:9090                           |
+| Tempo      | http://localhost:3200                           |
+| PostgreSQL | localhost:5432 (see below)                      |
+| Kafka      | kafka:9092, compose network only (see below)    |
 
 API credentials are `mifos` / `password` with the header
 `Fineract-Platform-TenantId: default`.
+
+### PostgreSQL
+
+Two databases: `fineract_tenants` (the tenant registry) and
+`fineract_default` (the data of tenant `default`). Fineract connects as
+`postgres`; the cluster superuser is `root`. Both passwords are in
+`config/docker/env/postgresql.env` (`FINERACT_DB_PASS` and
+`POSTGRES_PASSWORD`). SSL is off.
+
+```bash
+# from the host, with a local psql
+set -a; . config/docker/env/postgresql.env; set +a
+PGPASSWORD=$FINERACT_DB_PASS psql \
+  "host=localhost port=5432 user=postgres dbname=fineract_default sslmode=disable"
+
+# or without one
+docker compose exec db psql -U root -d fineract_default
+```
+
+### Kafka
+
+Fineract publishes external business events, Avro encoded, to the topic
+`external-events` (10 partitions).
+
+Kafka is only usable from containers on the compose network, at
+`kafka:9092`. Port 9092 is published on the host, but the broker advertises
+itself as `kafka:9092` (`KAFKA_ADVERTISED_LISTENERS` in
+`config/docker/env/kafka-server.env`). A client on the host therefore
+connects to `localhost:9092`, is told to use `kafka:9092`, and fails with
+`UnknownHostException: kafka`. Use the tools inside the broker container:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:9092 --list
+docker compose exec kafka /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka:9092 --topic external-events
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:9092 --topic external-events \
+  --from-beginning --max-messages 5 --timeout-ms 10000
+```
+
+Only event types enabled in `m_external_event_configuration` are produced;
+all of them ship disabled (see Troubleshooting).
 
 ## Troubleshooting
 
