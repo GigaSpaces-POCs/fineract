@@ -24,7 +24,6 @@ import io.micrometer.core.instrument.Meter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.config.MeterFilter;
-import java.util.regex.Pattern;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.EnableAspectJAutoProxy;
@@ -34,8 +33,19 @@ import org.springframework.http.server.observation.ServerRequestObservationConve
 @EnableAspectJAutoProxy
 public class MetricsConfig {
 
-    // Patterns to normalize URIs by replacing numeric IDs with placeholders
-    private static final Pattern NUMERIC_ID_PATTERN = Pattern.compile("/\\d+(?=/|\\?|$)");
+    private static final String HTTP_SERVER_REQUESTS = "http.server.requests";
+
+    private static final String URI_TAG = "uri";
+
+    /**
+     * Maximum number of distinct uri tag values kept for {@value #HTTP_SERVER_REQUESTS}. Beyond this,
+     * further new values are denied outright - see {@link #httpServerRequestsCardinalityLimit()}.
+     *
+     * The API declares roughly 470 distinct JAX-RS path templates, so this is sized above the full
+     * route surface with headroom rather than as a tight budget: a limit below the number of routes
+     * would silently drop whichever endpoints happened to be called last.
+     */
+    private static final int MAX_URI_TAG_VALUES = 650;
 
     @Bean
     public TimedAspect timedAspect(MeterRegistry registry) {
@@ -44,8 +54,8 @@ public class MetricsConfig {
 
     /**
      * Replaces Spring Boot's default "uri=UNKNOWN" fallback (which always applies to Fineract's
-     * Jersey-routed API, see {@link FineractServerRequestObservationConvention}) with the actual
-     * request path, so the MeterFilter below has something real to normalize.
+     * Jersey-routed API) with the actual request path, normalized to bound its cardinality. This
+     * convention drives both metrics and traces.
      */
     @Bean
     public ServerRequestObservationConvention serverRequestObservationConvention() {
@@ -53,51 +63,37 @@ public class MetricsConfig {
     }
 
     /**
-     * Normalizes HTTP server request URIs by replacing numeric IDs with {id} placeholders.
-     * This reduces cardinality explosion by grouping similar requests:
-     * 
-     * Examples:
-     * - /api/v1/clients/123 → /api/v1/clients/{id}
-     * - /api/v1/clients/456/loans/789 → /api/v1/clients/{id}/loans/{id}
-     * - /api/v1/loans/123/transactions/456 → /api/v1/loans/{id}/transactions/{id}
-     * 
-     * This works by transforming the Meter.Id before it's recorded, so URIs never become "UNKNOWN".
+     * Backstop for meters that do not pass through
+     * {@link FineractServerRequestObservationConvention} - for example a uri recorded by another
+     * instrumentation path. Normalizing an already-normalized uri is a no-op, so this is safe to layer
+     * on top of the convention.
      */
     @Bean
     public MeterFilter httpServerRequestsUriNormalization() {
         return new MeterFilter() {
+
             @Override
             public Meter.Id map(Meter.Id id) {
-                if (!"http.server.requests".equals(id.getName())) {
+                if (!HTTP_SERVER_REQUESTS.equals(id.getName())) {
                     return id;
                 }
-                
-                String uri = id.getTag("uri");
-                if (uri == null || "UNKNOWN".equals(uri) || "NOT_FOUND".equals(uri)) {
+                String uri = id.getTag(URI_TAG);
+                if (uri == null) {
                     return id;
                 }
-                
-                // Normalize the URI by replacing all numeric IDs with {id}
-                String normalizedUri = NUMERIC_ID_PATTERN.matcher(uri).replaceAll("/{id}");
-                
-                if (!uri.equals(normalizedUri)) {
-                    // Return a new Meter.Id with the normalized URI
-                    return id.withTag(Tag.of("uri", normalizedUri));
-                }
-                
-                return id;
+                String normalizedUri = FineractServerRequestObservationConvention.normalizeUri(uri);
+                return uri.equals(normalizedUri) ? id : id.withTag(Tag.of(URI_TAG, normalizedUri));
             }
         };
     }
 
     /**
-     * Limits the number of unique URI tag values to prevent unbounded cardinality growth.
-     * When more than 100 unique URIs are detected, further new URIs are denied from metrics.
-     * 
-     * This is a safety measure to prevent cardinality explosion in Prometheus.
+     * Limits the number of distinct uri tag values to prevent unbounded cardinality growth. Paths that
+     * normalization cannot collapse - external ids, dates, report names - still consume slots here, so
+     * this remains a meaningful safety net.
      */
     @Bean
     public MeterFilter httpServerRequestsCardinalityLimit() {
-        return MeterFilter.maximumAllowableTags("http.server.requests", "uri", 100, MeterFilter.deny());
+        return MeterFilter.maximumAllowableTags(HTTP_SERVER_REQUESTS, URI_TAG, MAX_URI_TAG_VALUES, MeterFilter.deny());
     }
 }

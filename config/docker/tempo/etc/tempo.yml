@@ -47,7 +47,11 @@ ingester:
 
 compactor:
   compaction:
-    block_retention: 1h                # overall Tempo trace retention. set for demo purposes
+    block_retention: 24h               # overall Tempo trace retention. 1h is unusable for an
+                                       # unattended run -- a trace is gone before anyone looks at
+                                       # it. Measured cost is ~3.7 kB of compacted blocks per
+                                       # simulated API action, so 24h at the default traffic rate
+                                       # settles at roughly 80 MB.
 
 metrics_generator:
   registry:
@@ -55,18 +59,21 @@ metrics_generator:
       source: tempo
       cluster: docker-compose
   storage:
-    path: /tmp/tempo/generator/wal
+    path: /var/tempo/generator/wal
     remote_write:
       - url: http://prometheus:9090/api/v1/write
         send_exemplars: true
 
+# Storage lives on the fineract-tempo-data named volume, not the host's /tmp.
+# /tmp is swept by systemd-tmpfiles at 10 days on this host, which would delete
+# blocks underneath a running Tempo once retention exceeds that.
 storage:
   trace:
     backend: local                     # backend configuration to use
     wal:
-      path: /tmp/tempo/wal             # where to store the wal locally
+      path: /var/tempo/wal             # where to store the wal locally
     local:
-      path: /tmp/tempo/blocks
+      path: /var/tempo/blocks
 
 #overrides:
 #  defaults:

@@ -1,146 +1,193 @@
 # Build and Deploy Instructions
 
+Builds the `fineract` container image and runs it alongside the local
+observability stack (Prometheus, Tempo, Grafana) and a Kafka broker.
+
 ## Prerequisites
 
-- **Java 21+** (Current environment has Java 17, needs upgrade)
-- **Gradle** (included in repository)
+- **JDK 25.** `build.gradle` pins the Gradle toolchain to Java 25, and Gradle
+  itself must *run* on 21+ because two buildscript plugins
+  (`cucumber-runner`, `swagger-brake`) require it at configuration time. There
+  is no toolchain resolver configured, so Gradle will not download a JDK for
+  you - it must already be installed.
+- **Docker** with the Compose plugin (`docker compose`, v2+). The image is
+  built straight into the Docker daemon, so a daemon is required even for the
+  build step.
+- Gradle itself is provided by the wrapper in this repository.
 
-## Step 1: Install Java 21
-
-```bash
-# Using Homebrew on macOS
-brew install java@21
-
-# Or download from:
-# https://jdk.java.net/21/
-
-# Verify installation:
-java -version
-```
-
-## Step 2: Build Fineract
-
-From the project root (`/Users/yoramweinreb/work/fineract/`):
+Verify the toolchain is visible before building:
 
 ```bash
-# Build only the provider (faster than full build)
-./gradlew :fineract-provider:build -x test
-
-# Or full build with all modules:
-./gradlew build -x test
+java -version            # expect 25.x
+./gradlew javaToolchains # expect an entry for JDK 25
 ```
 
-Expected build time: 5-15 minutes depending on your machine
-
-## Step 3: Verify Build Success
-
-Look for output like:
-```
-BUILD SUCCESSFUL in XXXs
-```
-
-The WAR file will be at:
-```
-fineract-provider/build/libs/fineract-provider-1.x.x-SNAPSHOT.war
-```
-
-## Step 4: Deploy
-
-### Option A: Docker Compose (Recommended)
-
-If using docker-compose:
+If your system default is an older JDK, either point Gradle at 25 for this
+user:
 
 ```bash
-# Stop running container
-docker-compose down
-
-# Rebuild the Docker image
-docker-compose build
-
-# Start with new image
-docker-compose up -d
+echo 'org.gradle.java.home=/path/to/jdk-25' >> ~/.gradle/gradle.properties
 ```
 
-### Option B: Direct Tomcat Deployment
+or export `JAVA_HOME=/path/to/jdk-25` for the build.
+
+## Step 1: Build the image
+
+From the repository root:
 
 ```bash
-# Copy WAR to Tomcat webapps
-cp fineract-provider/build/libs/fineract-provider-1.x.x-SNAPSHOT.war \
-   /path/to/tomcat/webapps/fineract-provider.war
-
-# Restart Tomcat
-./path/to/tomcat/bin/shutdown.sh
-./path/to/tomcat/bin/startup.sh
+./gradlew :fineract-provider:jibDockerBuild -x test
 ```
 
-### Option C: Gradle Task
+This uses [jib](https://github.com/GoogleContainerTools/jib) - there is no
+Dockerfile in this repository - and produces `fineract:latest` plus a
+version-tagged image in the local Docker daemon. Expect roughly 3-5 minutes on
+a warm Gradle cache.
+
+Confirm the image exists:
 
 ```bash
-# Some configurations support direct deployment
-./gradlew :fineract-provider:bootRun
+docker images fineract
 ```
 
-## Step 5: Verify Deployment
+## Step 2: Prepare the log bind mount
 
-Once deployed, check that Prometheus metrics show normalized URIs:
+The compose files run the container as `${FINERACT_USER:-1000}` and bind-mount
+`build/fineract/logs`. If your host UID is not 1000, that directory is not
+writable by the container. This only matters once file logging is switched on
+(`config/docker/env/debug.env` sets `-Dlogging.config`), but it costs nothing
+to get right up front:
 
 ```bash
-# Query Prometheus metrics
-curl -s "http://localhost:8443/fineract-provider/actuator/prometheus" | grep "http_server_requests_seconds_count"
-
-# Expected output (normalized URIs, no UNKNOWN):
-# http_server_requests_seconds_count{application="fineract",method="GET",status="200",uri="/api/v1/clients/{id}"}
-# http_server_requests_seconds_count{application="fineract",method="GET",status="200",uri="/api/v1/loans/{id}"}
-# etc.
+mkdir -p build/fineract/logs
+printf 'FINERACT_USER=%s\nFINERACT_GROUP=%s\n' "$(id -u)" "$(id -g)" > .env
 ```
 
-Or query Prometheus:
+Compose reads `.env` from the repository root automatically. Note that
+`FINERACT_USER` in `config/docker/env/fineract-common.env` does **not** control
+this - that file is an `env_file`, which only injects variables into the
+running container and is never consulted for Compose's own `${...}`
+substitution.
+
+## Step 3: Start the stack
 
 ```bash
-curl "http://localhost:9090/api/v1/query?query=http_server_requests_seconds_count" | jq .
+docker compose up -d
 ```
+
+`docker-compose.override.yml` is picked up automatically alongside
+`docker-compose.yml` and adds Prometheus, Tempo, Grafana and Kafka.
+
+First start runs the full Liquibase migration; the application needs roughly
+two minutes before it answers. Watch progress with:
+
+```bash
+docker compose logs -f fineract
+```
+
+It is ready when the log reports `Started ServerApplication`.
+
+## Step 4: Verify
+
+```bash
+docker compose ps                       # all services up, fineract healthy
+curl -sk https://localhost:8443/fineract-provider/actuator/prometheus | head
+```
+
+Check that request URIs are normalized rather than reported as `UNKNOWN`:
+
+```bash
+curl -sk https://localhost:8443/fineract-provider/actuator/prometheus \
+  | grep '^http_server_requests_seconds_count'
+```
+
+Expect entries such as `uri="/api/v1/offices/{id}"`, and no `uri="UNKNOWN"`.
+
+Endpoints:
+
+| Service    | Address                                         |
+| ---------- | ----------------------------------------------- |
+| Fineract   | https://localhost:8443/fineract-provider/api/v1 |
+| Grafana    | http://localhost:3000 (admin/admin)             |
+| Prometheus | http://localhost:9090                           |
+| Tempo      | http://localhost:3200                           |
+| PostgreSQL | localhost:5432 (see below)                      |
+| Kafka      | kafka:9092, compose network only (see below)    |
+
+API credentials are `mifos` / `password` with the header
+`Fineract-Platform-TenantId: default`.
+
+### PostgreSQL
+
+Two databases: `fineract_tenants` (the tenant registry) and
+`fineract_default` (the data of tenant `default`). Fineract connects as
+`postgres`; the cluster superuser is `root`. Both passwords are in
+`config/docker/env/postgresql.env` (`FINERACT_DB_PASS` and
+`POSTGRES_PASSWORD`). SSL is off.
+
+```bash
+# from the host, with a local psql
+set -a; . config/docker/env/postgresql.env; set +a
+PGPASSWORD=$FINERACT_DB_PASS psql \
+  "host=localhost port=5432 user=postgres dbname=fineract_default sslmode=disable"
+
+# or without one
+docker compose exec db psql -U root -d fineract_default
+```
+
+### Kafka
+
+Fineract publishes external business events, Avro encoded, to the topic
+`external-events` (10 partitions).
+
+Kafka is only usable from containers on the compose network, at
+`kafka:9092`. Port 9092 is published on the host, but the broker advertises
+itself as `kafka:9092` (`KAFKA_ADVERTISED_LISTENERS` in
+`config/docker/env/kafka-server.env`). A client on the host therefore
+connects to `localhost:9092`, is told to use `kafka:9092`, and fails with
+`UnknownHostException: kafka`. Use the tools inside the broker container:
+
+```bash
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:9092 --list
+docker compose exec kafka /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka:9092 --topic external-events
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:9092 --topic external-events \
+  --from-beginning --max-messages 5 --timeout-ms 10000
+```
+
+Only event types enabled in `m_external_event_configuration` are produced;
+all of them ship disabled (see Troubleshooting).
 
 ## Troubleshooting
 
-### Build fails with "Dependency requires JVM runtime version 21"
+**`Dependency requires at least JVM runtime version 21. This build uses a Java 17 JVM.`**
+Gradle is running on too old a JDK. See Prerequisites - this is about the JVM
+Gradle runs on, not the toolchain it compiles with.
 
-**Solution**: Install Java 21
+**`No matching toolchain found for JavaLanguageVersion 25`**
+JDK 25 is installed but Gradle cannot see it. Check `./gradlew javaToolchains`
+and set `org.gradle.java.home` as above.
+
+**Application will not start.** `docker compose logs fineract`. If it exits
+during migration, check that `db` is healthy first - `fineract` waits on its
+healthcheck.
+
+**Kafka topic stays empty.** External event *types* are all disabled by
+default (`m_external_event_configuration`), independently of
+`FINERACT_EXTERNAL_EVENTS_KAFKA_ENABLED`. Enable the ones you need:
+
 ```bash
-brew install java@21
-export JAVA_HOME=$(/usr/libexec/java_home -v 21)
-./gradlew --version  # Verify gradle sees Java 21
+curl -sk -X PUT https://localhost:8443/fineract-provider/api/v1/externalevents/configuration \
+  -H 'Fineract-Platform-TenantId: default' -H 'Content-Type: application/json' \
+  -u mifos:password \
+  -d '{"externalEventConfigurations":{"ClientCreateBusinessEvent":true}}'
 ```
 
-### Build fails with other errors
+## Changes in this branch
 
-Clear Gradle cache and rebuild:
-```bash
-./gradlew clean
-./gradlew :fineract-provider:build -x test
-```
-
-### Application won't start after deployment
-
-Check logs:
-```bash
-# If using Docker
-docker-compose logs fineract-server
-
-# If using Tomcat
-tail -f /path/to/tomcat/logs/catalina.out
-```
-
-Look for errors related to `MetricsConfig` class loading.
-
-## Changes Made
-
-This build includes the following improvement:
-
-**File**: `fineract-provider/src/main/java/org/apache/fineract/infrastructure/core/config/MetricsConfig.java`
-
-**Change**: Added URI normalization for Prometheus metrics
-- Replaces numeric IDs in URIs with `{id}` placeholders
-- Prevents "UNKNOWN" URIs in metrics
-- Example: `/api/v1/clients/123` → `/api/v1/clients/{id}`
-
-See [CHANGES_LOG.md](CHANGES_LOG.md) for full details.
+See [CHANGES_LOG.md](CHANGES_LOG.md). In short: HTTP server request URIs are
+resolved and normalized in
+`FineractServerRequestObservationConvention`, which feeds both metrics and
+traces, with `MetricsConfig` applying a cardinality backstop.
