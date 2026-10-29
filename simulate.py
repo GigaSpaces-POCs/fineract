@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Continuous client activity simulator for a local Fineract instance.
+Continuous client activity simulator for a Fineract instance.
 
 Use cases simulated (weighted-random, one per loop iteration):
   1. Client onboarding      - create a new active client
@@ -8,8 +8,21 @@ Use cases simulated (weighted-random, one per loop iteration):
   3. Savings transaction    - random deposit or withdrawal on an active account
   4. Loan application       - submit/approve/disburse a loan
   5. Loan repayment         - pay the next installment on an active loan
+  6. View client            - read a random existing client (broadens GET coverage)
+  7. KYC document upload    - attach a synthetic KYC document to a random existing client
+  8. KYC identifier capture - record an identity-document identifier on a random existing client
+  9. KYC case note          - log a gap/request/audit-style note on a random existing client
+  10. KYC document review   - list the documents already on file for a random existing client
 
-State (which clients/accounts/loans exist) is kept in a local JSON file so the
+Actions 6-10 operate on the broader pre-existing client population (fetched live via
+the API, not just entities this script created) rather than growing the client count -
+loosely modeled on the "Client Onboarding Document Intake (KYC)" agentic pattern:
+documents arrive, get captured against the case record (identifiers, notes, documents),
+and get reviewed. This script is a scripted HTTP client, not an actual document-parsing
+agent, so the DECIDE/FAN-OUT/REFLECT/LOOP steps in that pattern aren't modeled - only the
+concrete Fineract API calls a human analyst's work would eventually produce are.
+
+State (which clients/accounts/loans this script created) is kept in a local JSON file so the
 simulator can be stopped and restarted without losing track of what it created.
 """
 import argparse
@@ -73,6 +86,109 @@ LAST_NAMES = [
     "Okafor", "Mwangi", "Achebe", "Diallo", "Kimani", "Ndlovu", "Sharma", "Patel",
 ]
 
+# Fineract's identifier-document-type codes, from GET /clients/{id}/identifiers/template.
+IDENTIFIER_DOCUMENT_TYPES = [
+    (1, "Passport", lambda: "P" + "".join(random.choices("0123456789", k=8))),
+    (2, "Id", lambda: "".join(random.choices("0123456789", k=10))),
+    (3, "Drivers License", lambda: "DL" + "".join(random.choices("0123456789ABCDEFGHJKLMNPQRSTUVWXYZ", k=7))),
+    (4, "Any Other Id Type", lambda: "OTH" + "".join(random.choices("0123456789", k=6))),
+]
+
+# Fineract's content-store whitelist only allows these extensions/mime types by default.
+KYC_DOCUMENT_TYPES = [
+    ("Passport", "application/pdf", "pdf"),
+    ("ProofOfAddress", "application/pdf", "pdf"),
+    ("SourceOfFunds", "application/pdf", "pdf"),
+    ("CertificateOfIncorporation", "application/pdf", "pdf"),
+    ("OwnershipDeclaration", "application/pdf", "pdf"),
+    ("TaxForm", "application/pdf", "pdf"),
+]
+
+KYC_NOTES = [
+    "KYC: proof of address older than 3 months - document update requested",
+    "KYC: ownership chart missing - request sent to client",
+    "KYC: all required documents verified, no gaps identified",
+    "KYC: identity document expiring soon - renewal flagged",
+    "KYC: politically exposed person (PEP) declaration on file - enhanced due diligence note added",
+    "KYC: source-of-funds evidence received and reconciled against application",
+    "KYC: conflicting address across submitted documents - both sources cited, resolution pending",
+    "KYC: record reviewed and passed to screening and rules stage",
+]
+
+KYC_ADDRESSES = [
+    "14 Birchwood Lane, Springfield", "88 Harbor View Road, Rivermouth",
+    "221 Baker Street, Elmsworth", "7 Market Square, Dunholt", "56 Pine Ridge Drive, Fairhaven",
+]
+KYC_FUNDS_SOURCES = ["Salary / employment income", "Business income", "Inheritance", "Investment proceeds", "Sale of property"]
+
+
+def _random_document_number():
+    return "".join(random.choices("0123456789", k=9))
+
+
+def _pdf_text_lines_for(doc_name, client_name, document_number):
+    """Short lines of fake-but-plausible body text for a given KYC document type, tied to
+    the client it's being attached to and a freshly generated document number."""
+    today = today_str()
+    if doc_name == "Passport":
+        return ["PASSPORT", f"Name: {client_name}", f"Document No: {document_number}",
+                "Nationality: SIMULATED", f"Date of Issue: {today}"]
+    if doc_name == "ProofOfAddress":
+        return ["PROOF OF ADDRESS", f"Name: {client_name}",
+                f"Address: {random.choice(KYC_ADDRESSES)}", f"Date: {today}"]
+    if doc_name == "SourceOfFunds":
+        return ["SOURCE OF FUNDS DECLARATION", f"Name: {client_name}",
+                f"Declared Source: {random.choice(KYC_FUNDS_SOURCES)}", f"Date: {today}"]
+    if doc_name == "CertificateOfIncorporation":
+        return ["CERTIFICATE OF INCORPORATION", f"Entity Name: {client_name}",
+                f"Registration No: {document_number}", f"Date of Incorporation: {today}"]
+    if doc_name == "OwnershipDeclaration":
+        return ["OWNERSHIP AND CONTROL DECLARATION", f"Entity Name: {client_name}",
+                f"Beneficial Owner: {random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}",
+                f"Ownership Percentage: {random.randint(10, 100)}%"]
+    return ["TAX FORM", f"Name: {client_name}", f"Tax ID: {document_number}",
+            f"Tax Year: {date.today().year}"]
+
+
+def generate_kyc_pdf_bytes(doc_name, client_name, document_number):
+    """Builds a small, genuinely valid single-page PDF with the KYC lines above rendered
+    as real text - so the "document" is actually openable and readable, not just a filler
+    byte string wearing a .pdf extension."""
+    lines = _pdf_text_lines_for(doc_name, client_name, document_number)
+    text_ops = ["BT", "/F1 14 Tf", "72 720 Td", "16 TL"]
+    for i, line in enumerate(lines):
+        escaped = line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        if i > 0:
+            text_ops.append("T*")
+        text_ops.append(f"({escaped}) Tj")
+    text_ops.append("ET")
+    stream_data = "\n".join(text_ops).encode("latin-1")
+
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream_data)).encode() + b" >>\nstream\n" + stream_data + b"\nendstream",
+    ]
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref_offset = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for off in offsets[1:]:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF"
+    ).encode()
+    return bytes(out)
+
 
 def today_str():
     return date.today().strftime("%d %B %Y")
@@ -88,12 +204,18 @@ class FineractClient:
             "Content-Type": "application/json",
         }
 
-    def _request(self, method, path, params=None, body=None):
+    def _request(self, method, path, params=None, body=None, content_type="application/json", raw_body=None):
         url = f"{self.base_url}{path}"
         if params:
             query = "&".join(f"{k}={v}" for k, v in params.items())
             url = f"{url}?{query}"
-        data = json.dumps(body).encode() if body is not None else None
+        if raw_body is not None:
+            data = raw_body
+        else:
+            data = json.dumps(body).encode() if body is not None else None
+        headers = dict(self.headers)
+        if data is not None:
+            headers["Content-Type"] = content_type
 
         # HTTPError means the server answered and rejected us: a retry would
         # just repeat the same rejection, so it propagates immediately.
@@ -101,7 +223,7 @@ class FineractClient:
         # means the server is unreachable or restarting, so back off and retry.
         delay = 1.0
         for attempt in range(1, MAX_RETRIES + 1):
-            req = urllib.request.Request(url, data=data, headers=self.headers, method=method)
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=15, context=_INSECURE_SSL_CONTEXT) as resp:
                     raw = resp.read()
@@ -125,6 +247,28 @@ class FineractClient:
     def put(self, path, params=None, body=None):
         return self._request("PUT", path, params=params, body=body)
 
+    def post_multipart(self, path, fields, file_field_name, file_name, file_bytes, file_content_type):
+        boundary = f"----fineract-sim-{random.randint(10**15, 10**16 - 1)}"
+        parts = []
+        for key, value in fields.items():
+            parts.append(
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode()
+            )
+        parts.append(
+            (
+                f"--{boundary}\r\n"
+                f"Content-Disposition: form-data; name=\"{file_field_name}\"; filename=\"{file_name}\"\r\n"
+                f"Content-Type: {file_content_type}\r\n\r\n"
+            ).encode()
+            + file_bytes
+            + b"\r\n"
+        )
+        parts.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(parts)
+        return self._request(
+            "POST", path, raw_body=body, content_type=f"multipart/form-data; boundary={boundary}",
+        )
+
 
 class State:
     """Bounded, crash-safe view of what this simulator has created.
@@ -144,6 +288,9 @@ class State:
         self.save_every = max(1, save_every)
         self._dirty = 0
         self.data = {"clients": [], "savings": [], "loans": []}
+        # Not persisted - just an in-process cache of the live system's total client
+        # count, used to pick a random *existing* client for the KYC/read actions.
+        self.remote_client_total = None
         if self.path.exists():
             try:
                 loaded = json.loads(self.path.read_text())
@@ -224,6 +371,23 @@ def log(msg):
 def fetch_offices(api):
     offices = api.get("/offices")
     return [o["id"] for o in offices]
+
+
+def fetch_random_existing_client(api, state):
+    """Picks a random client from the *entire* live population (not just ones this
+    script created) - used by the read-only and KYC actions, per the deliberate
+    choice to exercise those against the existing dataset rather than only the
+    clients this run has onboarded."""
+    if state.remote_client_total is None:
+        page = api.get("/clients", params={"limit": 1})
+        state.remote_client_total = page.get("totalFilteredRecords", 0)
+    total = state.remote_client_total
+    if not total:
+        return None
+    offset = random.randint(0, total - 1)
+    page = api.get("/clients", params={"limit": 1, "offset": offset})
+    items = page.get("pageItems", [])
+    return items[0] if items else None
 
 
 def onboard_client(api, state, office_ids):
@@ -381,12 +545,91 @@ def loan_repayment(api, state):
     return True
 
 
+def view_client(api, state):
+    client = fetch_random_existing_client(api, state)
+    if client is None:
+        return False
+    details = api.get(f"/clients/{client['id']}")
+    log(f"Viewed client #{client['id']} ({details.get('displayName')}) - status {details.get('status', {}).get('value')}")
+    return True
+
+
+def upload_client_document(api, state):
+    client = fetch_random_existing_client(api, state)
+    if client is None:
+        return False
+    doc_name, mime_type, ext = random.choice(KYC_DOCUMENT_TYPES)
+    client_name = client.get("displayName", "Unknown Client")
+    document_number = _random_document_number()
+    file_bytes = generate_kyc_pdf_bytes(doc_name, client_name, document_number)
+    file_name = f"{doc_name.lower()}_{document_number}.{ext}"
+    try:
+        api.post_multipart(
+            f"/clients/{client['id']}/documents",
+            fields={"name": doc_name, "description": f"KYC: {doc_name} captured during onboarding intake"},
+            file_field_name="file",
+            file_name=file_name,
+            file_bytes=file_bytes,
+            file_content_type=mime_type,
+        )
+    except RuntimeError as e:
+        log(f"Document upload ({doc_name}) for client #{client['id']} failed: {e}")
+        return False
+    log(f"Uploaded {doc_name} document for client #{client['id']} ({client_name})")
+    return True
+
+
+def add_client_identifier(api, state):
+    client = fetch_random_existing_client(api, state)
+    if client is None:
+        return False
+    doc_type_id, doc_type_name, key_generator = random.choice(IDENTIFIER_DOCUMENT_TYPES)
+    document_key = key_generator()
+    try:
+        api.post(f"/clients/{client['id']}/identifiers", body={
+            "documentTypeId": doc_type_id,
+            "documentKey": document_key,
+            "status": "ACTIVE",
+            "description": f"KYC: {doc_type_name} captured during onboarding intake",
+            "locale": LOCALE,
+        })
+    except RuntimeError as e:
+        log(f"Identifier capture ({doc_type_name}) for client #{client['id']} failed: {e}")
+        return False
+    log(f"Recorded {doc_type_name} identifier for client #{client['id']} ({client.get('displayName')})")
+    return True
+
+
+def add_client_kyc_note(api, state):
+    client = fetch_random_existing_client(api, state)
+    if client is None:
+        return False
+    note = random.choice(KYC_NOTES)
+    api.post(f"/clients/{client['id']}/notes", body={"note": note})
+    log(f"Added KYC note to client #{client['id']} ({client.get('displayName')}): {note}")
+    return True
+
+
+def review_client_documents(api, state):
+    client = fetch_random_existing_client(api, state)
+    if client is None:
+        return False
+    documents = api.get(f"/clients/{client['id']}/documents")
+    log(f"Reviewed documents for client #{client['id']} ({client.get('displayName')}): {len(documents)} on file")
+    return True
+
+
 ACTIONS = [
     ("onboard", onboard_client, 3),
     ("open_savings", open_savings, 3),
     ("savings_tx", savings_transaction, 5),
     ("apply_loan", apply_loan, 2),
     ("loan_repayment", loan_repayment, 4),
+    ("view_client", view_client, 3),
+    ("upload_document", upload_client_document, 3),
+    ("add_identifier", add_client_identifier, 3),
+    ("add_kyc_note", add_client_kyc_note, 2),
+    ("review_documents", review_client_documents, 2),
 ]
 
 
