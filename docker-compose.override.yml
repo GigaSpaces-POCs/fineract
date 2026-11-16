@@ -38,6 +38,12 @@
 # filesystem. Steady-state logging is negligible (~8 bytes per simulated API
 # action), so these caps exist purely to bound the failure case. Total ceiling
 # across the stack is ~430 MB.
+#
+# Every service below except db sets `restart: unless-stopped` (db inherits
+# `restart: always` from postgresql.yml). Without a policy Docker leaves a
+# container stopped when the host reboots, so only db came back and the API
+# stayed down until someone ran `docker compose start`. unless-stopped still
+# keeps a deliberate `docker compose stop` in effect across a reboot.
 services:
   # Postgres 18 uses a versioned data directory (/var/lib/postgresql/18/docker),
   # not the pre-18 /var/lib/postgresql/data, so the parent tree is mounted to stay
@@ -53,6 +59,7 @@ services:
 
   kafka:
     image: "apache/kafka:4.2.0-rc2"
+    restart: unless-stopped
     ports:
       - "9092:9092"
     env_file:
@@ -69,6 +76,7 @@ services:
     extends:
       file: ./config/docker/compose/observability.yml
       service: prometheus
+    restart: unless-stopped
     logging:
       driver: json-file
       options:
@@ -88,6 +96,7 @@ services:
     extends:
       file: ./config/docker/compose/observability.yml
       service: grafana
+    restart: unless-stopped
     logging:
       driver: json-file
       options:
@@ -100,6 +109,7 @@ services:
     extends:
       file: ./config/docker/compose/observability.yml
       service: tempo
+    restart: unless-stopped
     logging:
       driver: json-file
       options:
@@ -118,6 +128,15 @@ services:
       - fineract-tempo-data:/var/tempo
 
   fineract:
+    restart: unless-stopped
+    # docker-compose.yml publishes 5000 and fineract-common.env starts the JDWP
+    # debug agent there with address=*:5000. JDWP has no authentication and can
+    # invoke any method in the JVM, so whoever reaches the port controls the
+    # app. Both files are upstream, so the port list is replaced rather than
+    # merged, and JAVA_TOOL_OPTIONS (under environment) is restated without the
+    # agent. Keep that string in step with fineract-common.env.
+    ports: !override
+      - "8443:8443"
     depends_on:
       kafka:
         condition: service_started
@@ -135,6 +154,7 @@ services:
     # entry in m_external_event_configuration ships disabled, so no event type is
     # produced until it is switched on via PUT /api/v1/externalevents/configuration.
     environment:
+      JAVA_TOOL_OPTIONS: "-Xmx1G -XX:MinRAMPercentage=25 -XX:MaxRAMPercentage=80 -XX:TieredStopAtLevel=1 -XX:ReservedCodeCacheSize=256m -XX:+UseContainerSupport -XX:+UseStringDeduplication --add-exports=java.naming/com.sun.jndi.ldap=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.security=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.management/javax.management=ALL-UNNAMED --add-opens=java.naming/javax.naming=ALL-UNNAMED"
       FINERACT_EXTERNAL_EVENTS_ENABLED: "true"
       FINERACT_EXTERNAL_EVENTS_KAFKA_ENABLED: "true"
       FINERACT_EXTERNAL_EVENTS_KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
